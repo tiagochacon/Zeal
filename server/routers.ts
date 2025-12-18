@@ -1,0 +1,546 @@
+import { COOKIE_NAME } from "@shared/const";
+import { getSessionCookieOptions } from "./_core/cookies";
+import { systemRouter } from "./_core/systemRouter";
+import { publicProcedure, protectedProcedure, router } from "./_core/trpc";
+import { z } from "zod";
+import { rateLimitMiddleware, RATE_LIMITS } from "./_core/rateLimit";
+import { ServiceError, ErrorCode, wrapServiceCall } from "./_core/errors";
+import {
+  createPatient,
+  getPatientsByDentist,
+  getPatientById,
+  updatePatient,
+  createConsultation,
+  getConsultationsByDentist,
+  getConsultationById,
+  updateConsultation,
+  getConsultationsByPatient,
+  getDefaultTemplates,
+  getTemplatesByDentist,
+  createTemplate
+} from "./db";
+import { storagePut } from "./storage";
+import { transcribeAudio } from "./_core/voiceTranscription";
+import { invokeLLM } from "./_core/llm";
+import { SOAPNote } from "../drizzle/schema";
+import { nanoid } from "nanoid";
+import { generateConsultationPDF } from "./pdfGenerator";
+
+// Import strict validation schemas
+import { createPatientSchema, updatePatientSchema, getPatientByIdSchema } from "../shared/schemas/patient";
+import {
+  createConsultationSchema,
+  uploadAudioSchema,
+  updateTranscriptSchema,
+  transcribeAudioSchema,
+  analyzeAndGenerateSOAPSchema,
+  updateSOAPSchema,
+  finalizeConsultationSchema,
+  exportPDFSchema,
+  getConsultationByIdSchema,
+  getConsultationsByPatientSchema,
+} from "../shared/schemas/consultation";
+
+export const appRouter = router({
+  system: systemRouter,
+  auth: router({
+    me: publicProcedure.query(opts => opts.ctx.user),
+    logout: publicProcedure.mutation(({ ctx }) => {
+      const cookieOptions = getSessionCookieOptions(ctx.req);
+      ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
+      return {
+        success: true,
+      } as const;
+    }),
+  }),
+
+  patients: router({
+    create: protectedProcedure
+      .input(createPatientSchema)
+      .mutation(async ({ ctx, input }) => {
+        await createPatient({
+          dentistId: ctx.user.id,
+          ...input,
+        });
+        return { success: true };
+      }),
+
+    list: protectedProcedure.query(async ({ ctx }) => {
+      return await getPatientsByDentist(ctx.user.id);
+    }),
+
+    getById: protectedProcedure
+      .input(getPatientByIdSchema)
+      .query(async ({ ctx, input }) => {
+        const patient = await getPatientById(input.id);
+        if (!patient || patient.dentistId !== ctx.user.id) {
+          throw new Error("Patient not found or access denied");
+        }
+        return patient;
+      }),
+
+    update: protectedProcedure
+      .input(updatePatientSchema)
+      .mutation(async ({ ctx, input }) => {
+        const patient = await getPatientById(input.id);
+        if (!patient || patient.dentistId !== ctx.user.id) {
+          throw new Error("Patient not found or access denied");
+        }
+
+        const { id, ...updateData } = input;
+        await updatePatient(id, updateData);
+        return { success: true };
+      }),
+  }),
+
+  consultations: router({
+    create: protectedProcedure
+      .input(createConsultationSchema)
+      .mutation(async ({ ctx, input }) => {
+        const result = await createConsultation({
+          dentistId: ctx.user.id,
+          patientId: input.patientId,
+          patientName: input.patientName,
+          templateUsed: input.templateUsed,
+          status: "draft",
+        });
+        return { success: true, consultationId: result.id };
+      }),
+
+    list: protectedProcedure.query(async ({ ctx }) => {
+      return await getConsultationsByDentist(ctx.user.id);
+    }),
+
+    getById: protectedProcedure
+      .input(getConsultationByIdSchema)
+      .query(async ({ ctx, input }) => {
+        const consultation = await getConsultationById(input.id);
+        if (!consultation || consultation.dentistId !== ctx.user.id) {
+          throw new Error("Consultation not found or access denied");
+        }
+        return consultation;
+      }),
+
+    getByPatient: protectedProcedure
+      .input(getConsultationsByPatientSchema)
+      .query(async ({ ctx, input }) => {
+        return await getConsultationsByPatient(input.patientId, ctx.user.id);
+      }),
+
+    uploadAudio: protectedProcedure
+      .input(uploadAudioSchema)
+      .mutation(async ({ ctx, input }) => {
+        const consultation = await getConsultationById(input.consultationId);
+        if (!consultation || consultation.dentistId !== ctx.user.id) {
+          throw new Error("Consultation not found or access denied");
+        }
+
+        // Audio file already uploaded via multipart endpoint
+        // Just save metadata to database
+        await updateConsultation(input.consultationId, {
+          audioUrl: input.audioUrl,
+          audioFileKey: input.fileKey,
+          audioDurationSeconds: input.durationSeconds,
+        });
+
+        return { success: true, audioUrl: input.audioUrl };
+      }),
+
+    updateTranscript: protectedProcedure
+      .input(updateTranscriptSchema)
+      .mutation(async ({ ctx, input }) => {
+        const consultation = await getConsultationById(input.consultationId);
+        if (!consultation || consultation.dentistId !== ctx.user.id) {
+          throw new Error("Consultation not found or access denied");
+        }
+
+        await updateConsultation(input.consultationId, {
+          transcript: input.transcript,
+        });
+
+        return { success: true };
+      }),
+
+    transcribe: protectedProcedure
+      .use(rateLimitMiddleware("transcribe", RATE_LIMITS.transcribe))
+      .input(transcribeAudioSchema)
+      .mutation(async ({ ctx, input }) => {
+        const consultation = await getConsultationById(input.consultationId);
+        if (!consultation || consultation.dentistId !== ctx.user.id) {
+          throw new Error("Consultation not found or access denied");
+        }
+
+        if (!consultation.audioUrl) {
+          throw new Error("No audio file found for this consultation");
+        }
+
+        try {
+          // Transcribe audio using Whisper with speaker identification
+          const result = await wrapServiceCall(
+            "Whisper API",
+            ErrorCode.TRANSCRIPTION_FAILED,
+            "Falha ao transcrever áudio. Tente novamente em alguns minutos.",
+            async () => {
+              return await transcribeAudio({
+                audioUrl: consultation.audioUrl!,
+                language: "pt",
+                prompt: "Consulta odontológica entre dentista e paciente. IMPORTANTE: Identifique e marque claramente cada falante usando 'Dentista:' ou 'Paciente:' no início de cada fala. Termos técnicos: cárie, gengivite, canal, restauração, periodontia, dente, molar, incisivo, prótese, implante.",
+              });
+            }
+          );
+
+          if ('error' in result) {
+            throw new ServiceError(
+              ErrorCode.TRANSCRIPTION_FAILED,
+              `Erro na transcrição: ${result.error}`,
+              { consultationId: input.consultationId }
+            );
+          }
+
+          // Update consultation with transcript and segments
+          // If this fails, we want to know - don't catch DB errors here
+          await updateConsultation(input.consultationId, {
+            transcript: result.text,
+            transcriptSegments: result.segments || [],
+          });
+
+          return { success: true, transcript: result.text, segments: result.segments };
+        } catch (error) {
+          // If it's already a ServiceError, rethrow it
+          if (error instanceof ServiceError) {
+            throw error;
+          }
+
+          // Otherwise, wrap it
+          throw new ServiceError(
+            ErrorCode.TRANSCRIPTION_FAILED,
+            "Erro inesperado ao processar transcrição",
+            { consultationId: input.consultationId },
+            error instanceof Error ? error : undefined
+          );
+        }
+      }),
+
+    analyzeAndGenerateSOAP: protectedProcedure
+      .use(rateLimitMiddleware("analyzeSOAP", RATE_LIMITS.analyzeSOAP))
+      .input(analyzeAndGenerateSOAPSchema)
+      .mutation(async ({ ctx, input }) => {
+        const consultation = await getConsultationById(input.consultationId);
+        if (!consultation || consultation.dentistId !== ctx.user.id) {
+          throw new Error("Consultation not found or access denied");
+        }
+
+        if (!consultation.transcript) {
+          throw new Error("No transcript found for this consultation");
+        }
+
+        // Dental AI analysis prompt
+        const prompt = `Você é um assistente de IA especializado em documentação odontológica brasileira.
+
+TRANSCRIÇÃO DA CONSULTA:
+${consultation.transcript}
+
+INSTRUÇÕES:
+1. Analise a transcrição e extraia informações clínicas relevantes
+2. Identifique automaticamente:
+   - Queixa principal (QP)
+   - História da doença atual (HDA)
+   - Histórico médico e odontológico
+   - Medicações em uso
+   - Exame clínico (achados objetivos)
+   - Diagnóstico odontológico
+   - Plano de tratamento proposto
+
+3. Use nomenclatura técnica odontológica brasileira:
+   - Sistema de numeração FDI (dente 16, 21, etc.)
+   - Faces: oclusal, mesial, distal, vestibular, lingual/palatina
+   - Diagnósticos: cárie classe I/II, gengivite localizada, periodontite, etc.
+
+4. Identifique RED FLAGS (sinais de alerta):
+   - Dor intensa ou persistente
+   - Sangramento excessivo
+   - Edema/tumefação
+   - Lesões suspeitas de malignidade
+   - Contraindicações para procedimentos (anticoagulantes, gravidez, etc.)
+
+5. Gere LEMBRETES clínicos se aplicável:
+   - Necessidade de profilaxia antibiótica (cardiopatias, próteses articulares)
+   - Ajuste de anticoagulante antes de cirurgia
+   - Atenção especial para diabéticos/hipertensos
+   - Verificar vacinação (hepatite B) se exposição a sangue
+
+FORMATO DE SAÍDA (JSON):
+{
+  "subjective": {
+    "queixa_principal": "string",
+    "historia_doenca_atual": "string",
+    "historico_medico": ["string"],
+    "medicacoes": [
+      {"nome": "string", "dose": "string", "frequencia": "string"}
+    ]
+  },
+  "objective": {
+    "exame_clinico_geral": "string",
+    "exame_clinico_especifico": ["string"],
+    "dentes_afetados": ["16", "21"]
+  },
+  "assessment": {
+    "diagnosticos": ["string"],
+    "red_flags": ["string"]
+  },
+  "plan": {
+    "tratamentos": [
+      {"procedimento": "string", "dente": "string", "urgencia": "baixa|media|alta"}
+    ],
+    "orientacoes": ["string"],
+    "lembretes_clinicos": ["string"]
+  }
+}
+
+Seja preciso, conciso e use terminologia clínica apropriada.`;
+
+        try {
+          // Call LLM for analysis with error handling
+          const response = await wrapServiceCall(
+            "GPT-4 LLM",
+            ErrorCode.LLM_RESPONSE_FAILED,
+            "Falha ao gerar análise SOAP. Tente novamente em alguns minutos.",
+            async () => {
+              return await invokeLLM({
+                messages: [
+                  { role: "system", content: "Você é um assistente especializado em documentação odontológica brasileira." },
+                  { role: "user", content: prompt }
+                ],
+                response_format: {
+                  type: "json_schema",
+                  json_schema: {
+                    name: "soap_note",
+                    strict: true,
+                    schema: {
+                      type: "object",
+                      properties: {
+                        subjective: {
+                          type: "object",
+                          properties: {
+                            queixa_principal: { type: "string" },
+                            historia_doenca_atual: { type: "string" },
+                            historico_medico: { type: "array", items: { type: "string" } },
+                            medicacoes: {
+                              type: "array",
+                              items: {
+                                type: "object",
+                                properties: {
+                                  nome: { type: "string" },
+                                  dose: { type: "string" },
+                                  frequencia: { type: "string" }
+                                },
+                                required: ["nome", "dose", "frequencia"],
+                                additionalProperties: false
+                              }
+                            }
+                          },
+                          required: ["queixa_principal", "historia_doenca_atual", "historico_medico", "medicacoes"],
+                          additionalProperties: false
+                        },
+                        objective: {
+                          type: "object",
+                          properties: {
+                            exame_clinico_geral: { type: "string" },
+                            exame_clinico_especifico: { type: "array", items: { type: "string" } },
+                            dentes_afetados: { type: "array", items: { type: "string" } }
+                          },
+                          required: ["exame_clinico_geral", "exame_clinico_especifico", "dentes_afetados"],
+                          additionalProperties: false
+                        },
+                        assessment: {
+                          type: "object",
+                          properties: {
+                            diagnosticos: { type: "array", items: { type: "string" } },
+                            red_flags: { type: "array", items: { type: "string" } }
+                          },
+                          required: ["diagnosticos", "red_flags"],
+                          additionalProperties: false
+                        },
+                        plan: {
+                          type: "object",
+                          properties: {
+                            tratamentos: {
+                              type: "array",
+                              items: {
+                                type: "object",
+                                properties: {
+                                  procedimento: { type: "string" },
+                                  dente: { type: "string" },
+                                  urgencia: { type: "string", enum: ["baixa", "media", "alta"] }
+                                },
+                                required: ["procedimento", "dente", "urgencia"],
+                                additionalProperties: false
+                              }
+                            },
+                            orientacoes: { type: "array", items: { type: "string" } },
+                            lembretes_clinicos: { type: "array", items: { type: "string" } }
+                          },
+                          required: ["tratamentos", "orientacoes", "lembretes_clinicos"],
+                          additionalProperties: false
+                        }
+                      },
+                      required: ["subjective", "objective", "assessment", "plan"],
+                      additionalProperties: false
+                    }
+                  }
+                }
+              });
+            }
+          );
+
+          // Parse and validate response
+          let soapNote: SOAPNote;
+          try {
+            const content = response.choices[0]?.message?.content;
+            if (!content) {
+              throw new Error("Empty response from LLM");
+            }
+            soapNote = JSON.parse(typeof content === 'string' ? content : JSON.stringify(content));
+          } catch (parseError) {
+            throw new ServiceError(
+              ErrorCode.LLM_RESPONSE_INVALID,
+              "Resposta da IA em formato inválido. Tente novamente.",
+              { consultationId: input.consultationId },
+              parseError instanceof Error ? parseError : undefined
+            );
+          }
+
+          // Update consultation with SOAP note
+          // If this fails, we want to know - don't catch DB errors here
+          await updateConsultation(input.consultationId, {
+            soapNote: soapNote,
+          });
+
+          return { success: true, soapNote };
+        } catch (error) {
+          // If it's already a ServiceError, rethrow it
+          if (error instanceof ServiceError) {
+            throw error;
+          }
+
+          // Otherwise, wrap it
+          throw new ServiceError(
+            ErrorCode.LLM_RESPONSE_FAILED,
+            "Erro inesperado ao gerar análise SOAP",
+            { consultationId: input.consultationId },
+            error instanceof Error ? error : undefined
+          );
+        }
+      }),
+
+    updateSOAP: protectedProcedure
+      .input(updateSOAPSchema)
+      .mutation(async ({ ctx, input }) => {
+        const consultation = await getConsultationById(input.consultationId);
+        if (!consultation || consultation.dentistId !== ctx.user.id) {
+          throw new Error("Consultation not found or access denied");
+        }
+
+        await updateConsultation(input.consultationId, {
+          soapNote: input.soapNote,
+        });
+
+        return { success: true };
+      }),
+
+    finalize: protectedProcedure
+      .input(finalizeConsultationSchema)
+      .mutation(async ({ ctx, input }) => {
+        const consultation = await getConsultationById(input.consultationId);
+        if (!consultation || consultation.dentistId !== ctx.user.id) {
+          throw new Error("Consultation not found or access denied");
+        }
+
+        await updateConsultation(input.consultationId, {
+          status: "finalized",
+          finalizedAt: new Date(),
+        });
+
+        return { success: true };
+      }),
+
+    exportPDF: protectedProcedure
+      .input(exportPDFSchema)
+      .mutation(async ({ ctx, input }) => {
+        const consultation = await getConsultationById(input.consultationId);
+        if (!consultation || consultation.dentistId !== ctx.user.id) {
+          throw new Error("Consultation not found or access denied");
+        }
+
+        if (!consultation.soapNote) {
+          throw new Error("No SOAP note available for this consultation");
+        }
+
+        try {
+          const pdfBuffer = await wrapServiceCall(
+            "PDF Generator",
+            ErrorCode.PDF_GENERATION_FAILED,
+            "Falha ao gerar PDF. Tente novamente em alguns minutos.",
+            async () => {
+              return await generateConsultationPDF({
+                patientName: consultation.patientName,
+                consultationDate: consultation.createdAt,
+                dentistName: ctx.user.name || "Dentista",
+                dentistCRO: ctx.user.croNumber || undefined,
+                soapNote: consultation.soapNote!,
+              });
+            }
+          );
+
+          // Convert buffer to base64 for transmission
+          const base64PDF = pdfBuffer.toString('base64');
+
+          return { success: true, pdfData: base64PDF };
+        } catch (error) {
+          if (error instanceof ServiceError) {
+            throw error;
+          }
+
+          throw new ServiceError(
+            ErrorCode.PDF_GENERATION_FAILED,
+            "Erro inesperado ao gerar PDF",
+            { consultationId: input.consultationId },
+            error instanceof Error ? error : undefined
+          );
+        }
+      }),
+  }),
+
+  templates: router({
+    listDefault: publicProcedure.query(async () => {
+      return await getDefaultTemplates();
+    }),
+
+    listMine: protectedProcedure.query(async ({ ctx }) => {
+      return await getTemplatesByDentist(ctx.user.id);
+    }),
+
+    create: protectedProcedure
+      .input(z.object({
+        name: z.string(),
+        description: z.string().optional(),
+        icon: z.string().optional(),
+        color: z.string().optional(),
+        promptCustomization: z.string().optional(),
+      }))
+      .mutation(async ({ ctx, input }) => {
+        await createTemplate({
+          dentistId: ctx.user.id,
+          name: input.name,
+          description: input.description,
+          icon: input.icon,
+          color: input.color,
+          promptCustomization: input.promptCustomization,
+          isDefault: false,
+        });
+        return { success: true };
+      }),
+  }),
+});
+
+export type AppRouter = typeof appRouter;
