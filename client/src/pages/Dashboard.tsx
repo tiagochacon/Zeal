@@ -26,7 +26,7 @@ export default function Dashboard() {
       <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-50 to-white">
         <Card className="max-w-md w-full">
           <CardHeader className="text-center">
-            <CardTitle className="text-3xl font-bold text-primary">DentScribe AI</CardTitle>
+            <CardTitle className="text-3xl font-bold text-primary">Zeal</CardTitle>
             <CardDescription className="text-lg">
               Assistente de IA para consultas odontológicas
             </CardDescription>
@@ -63,7 +63,7 @@ export default function Dashboard() {
       <header className="border-b bg-card">
         <div className="container py-4 flex items-center justify-between">
           <div>
-            <h1 className="text-2xl font-bold text-primary">DentScribe AI</h1>
+            <h1 className="text-2xl font-bold text-primary">Zeal</h1>
             <p className="text-sm text-muted-foreground">Assistente de IA para Odontologia</p>
           </div>
           <div className="flex items-center gap-4">
